@@ -1,0 +1,2090 @@
+---
+title: "&nbsp;"
+subtitle: "Bulk RNA-seq Analysis — *Acanthurus triostegus* Post-Settlement Development and Habitat-Specific Plasticity"
+author: "Marcela Herrera — Marine Eco-Evo-Devo Unit, Okinawa Institute of Science and Technology (OIST)"
+date: "2026"
+---
+
+## Analysis Notebook
+
+### Dataset and Experimental Design
+
+This R Markdown notebook describes the bulk RNA-seq analysis of *Acanthurus triostegus* juveniles across complementary experiments designed to investigate post-settlement development and habitat-associated developmental plasticity. Whole-body RNA was extracted and sequenced for all samples; sample sizes are provided in the Materials and Methods section of the manuscript.
+
+**Aquarium experiment.** Settlement-stage larvae (Day 0; D0) were collected at the reef crest on the northeast coast of Moorea, French Polynesia, and maintained in aquaria at the CRIOBE Marine Research Station. Individuals were sampled at D0, D1, D3, and D8 post-capture to characterize transcriptomic changes during early post-settlement development under controlled conditions.
+
+**Tidal-pool comparison.** To assess how well aquarium conditions reflected natural development, transcriptomes from aquarium-reared and tidal-pool larvae were compared at D0 and D1, corresponding to the first 24 h post-settlement.
+
+**In situ experiment.** Larvae were placed in cages within three natural nursery habitats (beach rock, mangrove, and sand beach), and wild juveniles naturally settled in each habitat were collected for comparison.
+
+### Install required packages
+
+```{r install-packages, eval=FALSE, echo=TRUE}
+# Bioconductor packages
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install(c(
+    "apeglm",
+    "ComplexHeatmap",
+    "DEGreport",
+    "DESeq2",
+    "EnhancedVolcano",
+    "genefilter",
+    "mgsa",
+    "topGO",
+    "UpSetR",
+    "vsn"
+))
+
+# CRAN packages
+install.packages(c(
+  "cowplot",
+  "dendextend",
+  "DT",
+  "factoextra",
+  "FactoMineR",
+  "FSA",
+  "ggalt",
+  "ggforce",
+  "ggpubr",
+  "ggrepel",
+  "ggVennDiagram",
+  "GOplot",
+  "gplots",
+  "gridExtra",
+  "jsonlite",
+  "knitr",
+  "magrittr",
+  "pheatmap",
+  "RColorBrewer",
+  "RVAideMemoire",
+  "tidyverse",
+  "vegan"
+))
+
+# GitHub packages
+if (!requireNamespace("devtools", quietly = TRUE))
+    install.packages("devtools")
+devtools::install_github("stephens999/ashr")
+```
+
+```{r load-libraries, include=FALSE, message=FALSE, warning=FALSE}
+# Load all required libraries. This chunk must be run at the start of every new R session.
+library(apeglm)
+library(ashr)
+library(ComplexHeatmap)
+library(cowplot)
+library(DEGreport)
+library(DESeq2)
+library(devtools)
+library(dendextend)
+library(dplyr)
+library(DT)
+library(EnhancedVolcano)
+library(factoextra)
+library(FactoMineR)
+library(FSA)
+library(genefilter)
+library(ggalt)
+library(ggforce)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+library(ggVennDiagram)
+library(GOplot)
+library(gplots)
+library(grid)
+library(gridBase)
+library(gridExtra)
+library(gridtext)
+library(jsonlite)
+library(knitr)
+library(magrittr)
+library(mgsa)
+library(pheatmap)
+library(RColorBrewer)
+library(RVAideMemoire)
+library(reshape2)
+library(stringr)
+library(tidyverse)
+library(topGO)
+library(UpSetR)
+library(vegan)
+library(vsn)
+```
+
+### Aquaria experiment and tidal-pool samples
+
+#### Importing counts and sample metadata 
+
+Raw counts were imported from the DegNorm-normalized output and assembled into a gene-by-sample count matrix. Sample metadata was loaded separately and aligned to the count matrix using matching sample identifiers. All file paths are defined relative to the project root directory to ensure reproducibility across systems.
+
+The dataset comprises 28 samples spanning four post-capture time points (D0, D1, D3, D8), including aquarium-reared (`_a`) and tidal-pool (`_tp`) individuals. Sample IDs follow the format `[timepoint]_[replicate]_[condition]` (e.g. `D1_3_a` for aquarium-reared replicate 3 at day 1). Tidal-pool samples are available only at D0 and D1 due to experimental constraints linked to nocturnal field sampling and predation risk.
+
+```{r setup, include=FALSE}
+# Clear workspace
+rm(list = ls())
+
+# Set project root directory
+wd <- "/Users/marcela/Desktop/manini-habitat-plasticity/"
+setwd(wd)
+```
+
+```{r load-data-aquaria, echo=TRUE, message=FALSE, warning=FALSE}
+# Load raw counts
+data <- read.table("./aquaria_counts.txt", header = TRUE, sep = "\t", dec = ".") 
+
+# Set gene IDs as row names and remove the ID column
+rownames(data) <- data$target_id 
+data <- data[, -1] 
+countData <- data %>% round() 
+
+### Read metadata
+sampleInfo <- read.table("./aquaria_metadata.txt", header = TRUE, sep = "\t")
+rownames(sampleInfo) <- sampleInfo$sample
+sampleInfo$sample <- NULL
+
+### Verify metadata
+all(rownames(sampleInfo) == colnames(countData))
+```
+
+#### Quality Control
+
+Initial quality control assessed library size distributions and expression variability across samples. Raw counts were visualized using log2-transformed values to identify potential outliers and evaluate consistency among replicates and conditions. Metadata and count matrices were cross-validated to ensure correct alignment of sample identities and experimental groups.
+
+```{r qc-boxplot-aquarium, echo=TRUE, message=FALSE, warning=FALSE, fig.width=6, fig.height=3}
+# Assign colors by time point
+colors <- ifelse(
+    grepl("^D0", names(countData)), "#00a087ff",
+    ifelse(
+        grepl("^D1", names(countData)), "#a05a2cff",
+        ifelse(
+            grepl("^D3", names(countData)), "#3131fbff",
+            ifelse(
+                grepl("^D8", names(countData)), "#cc229eff", "black"
+            )
+        )
+    )
+)
+
+boxplot(
+    log2(countData),
+    col = colors,
+    ylab = "log2(counts)",
+    notch = FALSE,
+    varwidth = FALSE,
+    cex = 0.4,
+    cex.axis = 0.8,
+    cex.lab = 0.8,
+    las = 2
+)
+```
+
+#### Normalization and DESeq2 object
+
+A DESeq2 dataset was constructed from the filtered count matrix, with genes as rows and samples as columns. Experimental designs were specified according to each analysis (e.g. `~ site + day` for full models, or `~ day` / `~ site` for subset analyses). Size factors were estimated using the median-of-ratios method to correct for library size differences across samples. Normalized counts were extracted for exploratory analyses and quality assessment.
+
+```{r deseq2-object-aquaria, echo=TRUE, message=FALSE, warning=FALSE}
+# Create DeSeq object
+dds <- DESeqDataSetFromMatrix(countData = as.matrix(countData), colData = sampleInfo, design = ~ site + day)
+
+# Pre-filtering
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep, ]
+
+# Estimate size factors (normalization)
+dds <- estimateSizeFactors(dds)
+
+# Extract normalized counts
+normCounts <- counts(dds, normalized = TRUE) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("target_id")
+```
+
+#### Principal Component Analysis
+
+Variance-stabilizing transformation (VST) was applied to normalized counts to reduce heteroscedasticity and make expression values suitable for multivariate analysis. Principal component analysis (PCA) was performed using `prcomp` on the transformed matrix with centering and scaling.
+
+Samples were projected onto the first two principal components (PC1 and PC2), which captured the dominant sources of variation in the dataset. Variance explained by each axis was derived from eigenvalues. Samples were visualized by developmental stage (day) and habitat (site), allowing assessment of clustering patterns associated with temporal progression and environmental origin. This ordination provided a global overview of transcriptomic structure and supported downstream differential expression analyses.
+
+```{r pca-aquarium, echo=TRUE, message=FALSE, warning=FALSE, fig.width=6, fig.height=5}
+# Apply variance-stabilizing transformation
+vst <- vst(dds, blind = TRUE)
+vstMatrix <- assay(vst)
+
+# Run PCA on all genes
+pca <- prcomp(t(vstMatrix), scale. = TRUE)
+percentVar <- pca$sdev^2 / sum(pca$sdev^2)
+
+# Combine PCA scores with metadata
+df <- cbind(sampleInfo, pca$x)
+df$day <- factor(df$day, levels = c("D0", "D1", "D3", "D8"))
+df$site <- factor(df$site, levels = c("aquaria", "tidal-pool"))
+
+# Color and shape scales
+colors <- c("D0" = "#00a087ff", "D1" = "#a05a2cff", "D3" = "#3131fbff", "D8" = "#cc229eff")
+shapes <- c("aquaria" = 16, "tidal-pool" = 17)  
+
+# PC1 vs PC2
+ggplot(df, aes(x = PC1, y = PC2, color = day, shape = site, group = day)) +
+    geom_vline(xintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey") +
+    geom_hline(yintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey") +
+    geom_point(size = 4) +
+    stat_ellipse(lwd = 0.2) +
+    scale_color_manual(values = colors) +
+    scale_shape_manual(values = shapes) +
+    xlab(sprintf("PC1 (%.2f%%)", percentVar[1] * 100)) +
+    ylab(sprintf("PC2 (%.2f%%)", percentVar[2] * 100)) +
+    theme_minimal() +
+    theme(
+        axis.title = element_text(colour = "black", size = 13),
+        axis.text = element_text(colour = "black", size = 12),
+        axis.ticks = element_line(colour = "black", linewidth = 0.5),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()
+    ) +
+    guides(
+        color = guide_legend(title = "Day"),
+        shape = guide_legend(title = "Site")
+    )
+```
+
+#### PERMANOVA
+
+Differences in global transcriptomic profiles across developmental stages were assessed using permutational multivariate analysis of variance (PERMANOVA) based on Euclidean distances computed from VST-transformed expression values. Statistical significance was evaluated using 10,000 permutations. Pairwise comparisons were performed with FDR correction.
+
+```{r permanova, echo=TRUE, message=FALSE, warning=FALSE}
+# Compute Euclidean distance matrix from VST values
+dis <- vegdist(t(vstMatrix), method = "euclidean", na.rm = TRUE)
+
+# Define time point factor
+day <- factor(sampleInfo$day, levels = c("D0", "D1", "D3", "D8"))
+
+# Global PERMANOVA
+adonis2(dis ~ day, data = sampleInfo, permutations = 10000)
+
+# Pairwise PERMANOVA with FDR correction
+pairwise.perm.manova(dis, day, p.method = "fdr", nperm = 10000)
+```
+
+#### Differential expression analysis
+
+Differential expression analyses were performed using DESeq2 for each experimental contrast. Genes with fewer than 10 total reads were excluded prior to analysis. A negative binomial generalized linear model was fitted, with design formulas adapted to each comparison (e.g. `~ site + day`, `~ day`, or `~ site`). Size factors were estimated using the median-of-ratios method, and dispersion parameters were fitted prior to hypothesis testing using Wald statistics. Log2 fold changes were shrunk using the ashr method to improve stability and interpretability. Differentially expressed genes (DEGs) were defined as those with and adjusted p-value < 0.05 and an absolute log2 fold-change ≥ 0.58 (≈1.5-fold change).
+
+##### Aquaria comparisons
+
+Aquarium-reared samples (`_a`) were analysed independently to characterize developmental transcriptional dynamics under controlled conditions. A DESeq2 model using ~ day was fitted, and sequential pairwise comparisons were performed between consecutive time points (D0–D1, D1–D3, D3–D8).
+
+```{r de-setup-aquaria, echo=TRUE, message=FALSE, warning=FALSE}
+# Subset aquaria samples
+countData_a <- countData[, grep("_a$", colnames(countData))]
+sampleInfo_a <- sampleInfo[grep("_a$", rownames(sampleInfo)), , drop = FALSE]
+
+# Create DESeq2 object
+dds_a <- DESeqDataSetFromMatrix(countData = as.matrix(countData_a), colData = sampleInfo_a, design = ~ day)
+
+# Pre-filter low counts
+keep <- rowSums(counts(dds_a)) >= 10
+dds_a <- dds_a[keep, ]
+
+# Get normalized counts
+dds_a <- estimateSizeFactors(dds_a)
+
+# Run DESeq2
+dds_a <- DESeq(dds_a)
+```
+
+###### D0 vs D1
+
+```{r de-D0vsD1-aquaria, echo=TRUE, message=FALSE, warning=FALSE}
+# Build results table
+resTableD0vsD1_a <- results(dds_a, contrast = c("day", "D1", "D0"), alpha = 0.05)
+
+# Apply fold change shrinkage
+resTableD0vsD1_a <- lfcShrink(dds_a, contrast = c("day", "D1", "D0"), res = resTableD0vsD1_a, type = "ashr")
+
+# Summarize results
+summary(resTableD0vsD1_a, alpha = 0.05)
+
+# Convert to data frame
+resTable_tbD0vsD1_a <- resTableD0vsD1_a %>% 
+  data.frame() %>% 
+  rownames_to_column(var = "target_id")
+
+# Define thresholds
+padj.cutoff <- 0.05
+lfc.cutoff <- log2(1.5)
+
+# Extract DEGs
+sigD0vsD1_a <- resTable_tbD0vsD1_a %>% 
+  filter(padj < padj.cutoff & abs(log2FoldChange) >= lfc.cutoff)
+
+# Up-regulated genes
+upD0vsD1_a <- subset(sigD0vsD1_a, log2FoldChange >= lfc.cutoff)
+
+# Down-regulated genes
+downD0vsD1_a <- subset(sigD0vsD1_a, log2FoldChange < lfc.cutoff)
+```
+
+###### D1 vs D3
+
+```{r de-D1vsD3-aquaria, echo=TRUE, message=FALSE, warning=FALSE}
+# Build results table
+resTableD1vsD3_a <- results(dds_a, contrast = c("day", "D3", "D1"), alpha = 0.05)
+
+# Apply fold change shrinkage
+resTableD1vsD3_a <- lfcShrink(dds_a, contrast = c("day", "D3", "D1"), res = resTableD1vsD3_a, type = "ashr")
+
+# Summarize results
+summary(resTableD1vsD3_a, alpha = 0.05)
+
+# Convert to data frame
+resTable_tbD1vsD3_a <- resTableD1vsD3_a %>% 
+  data.frame() %>% 
+  rownames_to_column(var = "target_id")
+
+# Define thresholds
+padj.cutoff <- 0.05
+lfc.cutoff <- log2(1.5)
+
+# Extract DEGs
+sigD1vsD3_a <- resTable_tbD1vsD3_a %>% 
+  filter(padj < padj.cutoff & abs(log2FoldChange) >= lfc.cutoff)
+
+# Up-regulated genes
+upD1vsD3_a <- subset(sigD1vsD3_a, log2FoldChange >= lfc.cutoff)
+
+# Down-regulated genes
+downD1vsD3_a <- subset(sigD1vsD3_a, log2FoldChange < lfc.cutoff)
+```
+
+###### D3 vs D8
+
+```{r de-D3vsD8-aquaria, echo=TRUE, message=FALSE, warning=FALSE}
+# Build results table
+resTableD3vsD8_a <- results(dds_a, contrast = c("day", "D3", "D8"), alpha = 0.05)
+
+# Apply fold change shrinkage
+resTableD3vsD8_a <- lfcShrink(dds_a, contrast = c("day", "D3", "D8"), res = resTableD3vsD8_a, type = "ashr")
+
+# Summarize results
+summary(resTableD3vsD8_a, alpha = 0.05)
+
+# Convert to data frame
+resTable_tbD3vsD8_a <- resTableD3vsD8_a %>% 
+  data.frame() %>% 
+  rownames_to_column(var = "target_id")
+
+# Define thresholds
+padj.cutoff <- 0.05
+lfc.cutoff <- log2(1.5)
+
+# Extract DEGs
+sigD3vsD8_a <- resTable_tbD3vsD8_a %>% 
+  filter(padj < padj.cutoff & abs(log2FoldChange) >= lfc.cutoff)
+
+# Up-regulated genes
+upD3vsD8_a <- subset(sigD3vsD8_a, log2FoldChange >= lfc.cutoff)
+
+# Down-regulated genes
+downD3vsD81_a <- subset(sigD3vsD8_a, log2FoldChange < lfc.cutoff)
+```
+
+##### Tidal-pool comparisons
+
+Tidal-pool samples (`_tp`) were analysed separately to capture early post-settlement transcriptional changes under natural conditions. Due to sampling constraints, only a single comparison (D0–D1) was performed.
+
+```{r de-setup-tidal-pool, echo=TRUE, message=FALSE, warning=FALSE}
+# Subset tidal-pool samples
+countData_tp <- countData[, grep("_tp$", colnames(countData))]
+sampleInfo_tp <- sampleInfo[grep("_tp$", rownames(sampleInfo)), , drop = FALSE]
+
+# Create DESeq2 object
+dds_tp <- DESeqDataSetFromMatrix(countData = as.matrix(countData_tp), colData = sampleInfo_tp, design = ~ day)
+
+# Pre-filter low counts
+keep <- rowSums(counts(dds_tp)) >= 10
+dds_tp <- dds_tp[keep, ]
+
+# Get normalized counts
+dds_tp <- estimateSizeFactors(dds_tp)
+
+# Run DESeq2
+dds_tp <- DESeq(dds_tp)
+```
+
+###### D0 vs D1
+
+```{r de-D0vsD1-tidal-pool, echo=TRUE, message=FALSE, warning=FALSE}
+# Build results table
+resTableD0vsD1_tp <- results(dds_tp, contrast = c("day", "D1", "D0"), alpha = 0.05)
+
+# Apply fold change shrinkage
+resTableD0vsD1_a <- lfcShrink(dds_tp, contrast = c("day", "D1", "D0"), res = resTableD0vsD1_tp, type = "ashr")
+
+# Summarize results
+summary(resTableD0vsD1_tp, alpha = 0.05)
+
+# Convert to data frame
+resTable_tbD0vsD1_tp <- resTableD0vsD1_tp %>% 
+  data.frame() %>% 
+  rownames_to_column(var = "target_id")
+
+# Define thresholds
+padj.cutoff <- 0.05
+lfc.cutoff <- log2(1.5)
+
+# Extract DEGs
+sigD0vsD1_tp <- resTable_tbD0vsD1_tp %>% 
+  filter(padj < padj.cutoff & abs(log2FoldChange) >= lfc.cutoff)
+
+# Up-regulated genes
+upD0vsD1_tp <- subset(sigD0vsD1_tp, log2FoldChange >= lfc.cutoff)
+
+# Down-regulated genes
+downD0vsD1_tp <- subset(sigD0vsD1_tp, log2FoldChange < lfc.cutoff)
+```
+
+<br/>
+
+##### Aquarium vs tidal-pool comparisons
+
+<br/>
+
+To assess environmental effects on transcriptional responses, aquarium and tidal-pool samples were compared at matched time points (D0 and D1). Separate DESeq2 models were constructed using `~ site` after subsetting by time point.
+
+<br/>
+
+###### D0 aquaria vs tidal-pool
+
+<br/>
+
+```{r de-setup-D0, echo=TRUE, message=FALSE, warning=FALSE}
+# Subset D0 samples
+countData_D0 <- countData[, grep("^D0_", colnames(countData))]
+sampleInfo_D0 <- sampleInfo[grep("^D0_", rownames(sampleInfo)), , drop = FALSE]
+
+# Create DESeq2 object
+dds_D0 <- DESeqDataSetFromMatrix(countData = as.matrix(countData_D0), colData = sampleInfo_D0, design = ~ site)
+
+# Pre-filter low counts
+keep <- rowSums(counts(dds_D0)) >= 10
+dds_D0 <- dds_D0[keep, ]
+
+# Get normalized counts
+dds_D0 <- estimateSizeFactors(dds_D0)
+
+# Run DESeq2
+dds_D0 <- DESeq(dds_D0)
+```
+
+```{r de-D0, echo=TRUE, message=FALSE, warning=FALSE}
+# Build results table
+resTable_D0a_vs_D0tp <- results(dds_D0, contrast = c("site", "tidal-pool", "aquaria"), alpha = 0.05) 
+
+# Apply fold change shrinkage
+resTable_D0a_vs_D0tp <- lfcShrink(dds_D0, contrast = c("site", "tidal-pool", "aquaria"), res = resTable_D0a_vs_D0tp, type = "ashr") 
+
+# Summarize results
+summary(resTable_D0a_vs_D0tp, alpha = 0.05)
+
+# Convert to data frame
+resTable_tbD0a_vs_D0tp <- resTable_D0a_vs_D0tp %>% 
+  data.frame() %>% 
+  rownames_to_column(var = "target_id")
+
+# Define thresholds
+padj.cutoff <- 0.05
+lfc.cutoff <- log2(1.5)
+
+# Extract DEGs
+sigD0a_vs_D0tp <- resTable_tbD0a_vs_D0tp %>% 
+  filter(padj < padj.cutoff & abs(log2FoldChange) >= lfc.cutoff)
+
+# Up-regulated genes
+upD0a_vs_D0tp <- subset(sigD0a_vs_D0tp, log2FoldChange >= lfc.cutoff)
+
+# Down-regulated genes
+downD0a_vs_D0tp <- subset(sigD0a_vs_D0tp, log2FoldChange < lfc.cutoff)
+```
+
+<br/>
+
+###### D1 aquaria vs tidal-pool
+
+<br/>
+
+```{r de-setup-D1, echo=TRUE, message=FALSE, warning=FALSE}
+# Subset D1 samples
+countData_D1 <- countData[, grep("^D1_", colnames(countData))]
+sampleInfo_D1 <- sampleInfo[grep("^D1_", rownames(sampleInfo)), , drop = FALSE]
+
+# Create DESeq2 object
+dds_D1 <- DESeqDataSetFromMatrix(countData = as.matrix(countData_D1), colData = sampleInfo_D1, design = ~ site)
+
+# Pre-filter low counts
+keep <- rowSums(counts(dds_D1)) >= 10
+dds_D1 <- dds_D1[keep, ]
+
+# Get normalized counts
+dds_D1 <- estimateSizeFactors(dds_D1)
+
+# Run DESeq2
+dds_D1 <- DESeq(dds_D1)
+```
+
+```{r de-D0, echo=TRUE, message=FALSE, warning=FALSE}
+# Build results table
+resTable_D1a_vs_D1tp <- results(dds_D1, contrast = c("site", "tidal-pool", "aquaria"), alpha = 0.05) 
+
+# Apply fold change shrinkage
+resTable_D1a_vs_D1tp <- lfcShrink(dds_D1, contrast = c("site", "tidal-pool", "aquaria"), res = resTable_D1a_vs_D1tp, type = "ashr") 
+
+# Summarize results
+summary(resTable_D1a_vs_D1tp, alpha = 0.05)
+
+# Convert to data frame
+resTable_tbD1a_vs_D1tp <- resTable_D1a_vs_D1tp %>% 
+  data.frame() %>% 
+  rownames_to_column(var = "target_id")
+
+# Define thresholds
+padj.cutoff <- 0.05
+lfc.cutoff <- log2(1.5)
+
+# Extract DEGs
+sigD1a_vs_D1tp <- resTable_tbD1a_vs_D1tp %>% 
+  filter(padj < padj.cutoff & abs(log2FoldChange) >= lfc.cutoff)
+
+# Up-regulated genes
+upD1a_vs_D1tp <- subset(sigD1a_vs_D1tp, log2FoldChange >= lfc.cutoff)
+
+# Down-regulated genes
+downD1a_vs_D1tp <- subset(sigD1a_vs_D1tp, log2FoldChange < lfc.cutoff)
+```
+
+<br/>
+
+##### UpSet Plot
+
+<br/>
+
+The UpSet plot visualizes intersections of DEGs across all pairwise comparisons. Each set corresponds to a specific contrast, and connected dots indicate shared DEGs between comparisons. Intersection sizes are shown in the upper bar plot. This representation highlights shared and condition-specific transcriptional responses across developmental transitions and habitat differences. The figure has been lightly edited for clarity, including color and layout adjustments.
+
+```{r upset-plot, echo=TRUE, message=FALSE, warning=FALSE, fig.width=8, fig.height=4.5}
+# Collect DEG gene IDs for each comparison
+# Aquaria comparisons
+D0vsD1_a <- as.character(sigD0vsD1_a$target_id)
+D1vsD3_a <- as.character(sigD1vsD3_a$target_id)
+D3vsD8_a <- as.character(sigD3vsD8_a$target_id)
+
+# Tidal-pool comparison
+D0vsD1_tp <- as.character(sigD0vsD1_tp$target_id)
+
+# Aquaria vs tidal-pool comparisons
+D0a_vs_D0tp <- as.character(sigD0a_vs_D0tp$target_id)
+D1a_vs_D1tp <- as.character(sigD1a_vs_D1tp$target_id)
+
+# Combine into named list
+all_DEGs <- list(
+    "D1a_vs_D1tp" = D1a_vs_D1tp,
+    "D0a_vs_D0tp" = D0a_vs_D0tp,
+    "D0vsD1_tp" = D0vsD1_tp,
+    "D3vsD8_a" = D3vsD8_a,
+    "D1vsD3_a" = D1vsD3_a,
+    "D0vsD1_a" = D0vsD1_a
+)
+
+# UpSet plot
+upset(
+    fromList(all_DEGs),
+    nsets = 6,
+    nintersects = 30,
+    sets = names(all_DEGs),
+    order.by = "freq",
+    mb.ratio = c(0.6, 0.4),
+    decreasing = TRUE,
+    number.angles = 30,
+    keep.order = TRUE,
+    empty.intersections = "off",
+    mainbar.y.label = "Intersection Size",
+    sets.x.label = "Number of DEGs"
+)
+
+# Binary membership matrix for downstream use
+DEG_matrix <- fromList(all_DEGs)
+rownames(DEG_matrix) <- unique(unlist(all_DEGs))
+```
+
+<br/>
+
+##### Venn Diagrams
+
+<br/>
+
+Venn diagrams were used to visualize overlaps of DEGs across selected comparisons within the aquaria and between-site analyses. Aquaria comparisons (D0–D1, D1–D3, D3–D8) were represented as a three-set Venn diagram to highlight shared and stage-specific transcriptional changes across development under controlled conditions. A second Venn diagram compared site-specific differential expression at matched time points (aquarium vs tidal-pool at D0 and D1), illustrating shared and environment-specific responses. All Venn diagrams were generated with a gradient color scale to represent overlap density. Visual parameters (transparency, label size, and color palette) were adjusted for clarity and consistency across figures.
+
+```{r venn-diagram, echo=TRUE, message=FALSE, warning=FALSE, fig.width=5, fig.height=6}
+# Each element of the list corresponds to a pairwise contrast between developmental time points in aquarium-reared samples
+
+venn_aquaria <- list(
+  "D0vsD1_a" = D0vsD1_a, # DEGs between D0 and D1 (aquaria)
+  "D1vsD3_a" = D1vsD3_a, # DEGs between D1 and D3 (aquaria)
+  "D3vsD8_a" = D3vsD8_a  # DEGs between D3 and D8 (aquaria)
+)
+
+# Venn diagram for aquaria comparisons
+ggVennDiagram(
+  venn_aquaria,
+  label_alpha = 0.7,
+  set_size = 0.5,
+  text_size = 4
+) +
+  scale_fill_gradientn(
+    colors = brewer.pal(9, "YlGnBu")[2:7]  # custom color gradient for overlap intensity
+  )
+
+# Comparison of aquarium vs tidal-pool individuals at matched developmental stages
+venn_D0_D1 <- list(
+  "D0a_vs_D0tp" = D0a_vs_D0tp, # DEGs between habitats at D0
+  "D1a_vs_D1tp" = D1a_vs_D1tp # DEGs between habitats at D1
+)
+
+# Venn diagram for habitat comparisons
+ggVennDiagram(
+  venn_D0_D1,
+  alpha = 0.7,  
+  set_size = 0.5, 
+  text_size = 4 
+) +
+  scale_fill_gradientn(
+    colors = brewer.pal(9, "YlGnBu")[2:7] 
+  )
+```
+
+<br/>
+
+##### Gene expression heatmap
+
+<br/>
+
+To visualize global expression patterns, variance-stabilized counts from aquarium samples were used to select the 1,000 most variable genes based on row variance. Hierarchical clustering was performed using Pearson correlation distances for genes and Euclidean distances for samples. Genes were clustered into 12 expression modules using hierarchical clustering with dynamic branch cutting. Sample clustering reflected overall transcriptional similarity across developmental stages. Cluster assignments were extracted for downstream interpretation and quantification of gene group sizes. The resulting heatmap provides a global overview of coordinated expression patterns underlying developmental transitions. This figure has been manually edited for clarity, including color and layout adjustments.
+
+```{r venn-diagram, echo=TRUE, message=FALSE, warning=FALSE, fig.width=6, fig.height=6}
+# Get vst from aquaria samples only
+vst_a <- vst(dds_a, blind = TRUE)
+vstMatrix_a <- assay(vst_a)
+
+# Select top 1000 genes with highest variance (based on row variance across samples to capture strongest biological signal)
+topVarGenes <- assay(vst_a[head(order(-rowVars(vstMatrix_a)), 1000), ]) 
+
+# Plot heatmap using Pearson's correlation for the dendrogram and using dendextend for colors
+# Row clustering (genes): Pearson correlation distance converted to hierarchical clustering
+Rowv_Pear  <- hclust(as.dist(1 - cor(t(topVarGenes)))) %>%
+  as.dendrogram() %>%
+  set("branches_k_color", k = 12) %>% # number of gene clusters
+  set("branches_lwd", 1) %>%
+  ladderize()
+
+# Column clustering (samples): Euclidean distance on transposed matrix
+Colv  <- topVarGenes %>%
+  t() %>%
+  dist() %>%
+  hclust() %>%
+  as.dendrogram() %>%
+  set("branches_k_color", k = 4) %>% # number of sample groups (D0, D1, D3, D8)
+  set("branches_lwd", 4) %>%
+  ladderize()
+
+# Plot heatmap with cluster labels
+# Row-scaled expression values; blue = low, white = mid, red = high expression
+heatmap <- heatmap.2(
+  topVarGenes,
+  col = colorRampPalette(c("blue", "white", "red"))(256),
+  Rowv = Rowv_Pear,
+  Colv = Colv,
+  scale = "row",
+  trace = "none",
+  density.info = "none",
+  dendrogram = "both",
+  lwid = c(1, 5),
+  lhei = c(2, 7),
+  key = TRUE,
+  keysize = 1.3
+)
+
+# Get genes in same order as shown in heatmap
+heatmapLabels <- labels(Rowv_Pear) %>% as.data.frame()
+colnames(heatmapLabels)[colnames(heatmapLabels) == "."] <- "target_id"
+
+# Get clusters from heatmap
+rowClusters <- as.data.frame(cutree(Rowv_Pear, k = 12)) %>%
+  rownames_to_column("target_id")
+
+# Assign cluster information to each gene
+geneClusterInfo <- heatmapLabels %>%
+  left_join(rowClusters, by = "target_id")
+
+# Verify how many genes there are for each cluster
+geneClusterInfo %>%
+  group_by(cutree(Rowv_Pear, k = 12)) %>%
+  summarise(count = n())
+```
+
+<br/>
+
+##### GO enrichment analyses with (topGO)
+
+<br/>
+
+Gene Ontology (GO) enrichment analyses were performed using topGO. Gene lists corresponding to DEGs from each contrast were tested for enrichment across the three GO ontologies: Biological Process (BP), Cellular Component (CC), and Molecular Function (MF). GO annotations were derived from a custom gene-to-GO mapping file. Genes without GO assignments (“no_hit”) were removed prior to analysis. For each gene list, a binary gene membership vector was constructed indicating whether each gene in the background set was present in the input DEG set. 
+
+Enrichment was tested using Fisher’s exact test implemented in topGO, with the “weight01” algorithm applied to account for GO graph topology and reduce redundancy among related terms. For each gene list and ontology, results were summarized using the top-ranked GO terms (up to 1,000 entries) and exported as tab-delimited files for downstream parsing and visualization.
+
+```{r topGO, echo=TRUE, message=FALSE, warning=FALSE, fig.width=6, fig.height=6}
+# Define input directory
+# Folder contains DEG gene lists (one gene ID per line per file)
+folder_of_interest = "./topGO"
+
+# List all gene list files in directory
+mult_files = list.files(folder_of_interest, pattern = "*.txt")
+
+for (go_category in c("bp", "cc", "mf")) {
+  annot_filename = "./manini.gene.GOterms.tsv" # Load GO annotation mapping
+  gene_id_to_go = readMappings(file = annot_filename) # Gene → GO term mapping
+  gene_id_to_go = gene_id_to_go[gene_id_to_go != "no_hit"] # Remove genes without GO annotation
+  gene_names = names(gene_id_to_go) # Background gene set
+  
+  # Loop over DEG lists
+  for (m in mult_files) { 
+    print(paste("Current file:", m))
+    genes_of_interest_filename = paste0(folder_of_interest, m) # Read gene list of interest (DEGs)
+    genes_of_interest = scan(genes_of_interest_filename, character(0), sep = "\n")
+    genelist = factor(as.integer(gene_names %in% genes_of_interest))  # Construct gene list for topGO
+    names(genelist) = gene_names
+    
+    # Create topGO data object
+    GOdata <- try( 
+      new(
+        "topGOdata",
+        ontology = toupper(go_category),
+        allGenes = genelist,
+        gene2GO = gene_id_to_go,
+        annotationFun = annFUN.gene2GO
+      )
+    ) 
+    
+    # Handle cases where object creation fails
+    if (class(GOdata) == "try-error") {
+      print (paste0("Error for file", m, "!"))
+      next
+    }
+    
+    # Run enrichment test
+    # Fisher’s exact test with "weight01" algorithm accounts for GO hierarchy structure
+     weight01.fisher <- runTest(
+      GOdata,
+      statistic = "fisher"
+    ) 
+    
+    #Extract results table (top 1000 GO terms ordered by p-value)
+    results_table <- GenTable(
+      GOdata,
+      P_value = weight01.fisher,
+      orderBy = "P_value",
+      topNodes = 1000, # topNodes: highest 1000 GO terms shown
+      numChar = 1000 # numChar: truncates GO term descriptions at 1000 chars (basically, disables truncation)
+    )
+    
+    # Write results to file
+    output_filename <- paste0("./topGO_", go_category, "_", m)
+
+    write.table(results_table, file = output_filename, quote = FALSE, sep = "\t")
+  }
+}
+
+# Post-processing step
+# Run external shell script to summarise GO results across files (must be executed in terminal in same directory)
+# ./summarize_topGO_output.sh
+```
+
+##### Circular GO visualization (GOPlot)
+
+<br/>
+
+Circular visualizations of enriched GO terms were generated using the GOplot package to integrate functional enrichment results with gene-level expression data. Enriched GO terms were curated from topGO results and filtered based on predefined biological process clusters of interest. GO term enrichment data were combined with gene-to-term annotations and differential expression results to link functional categories with gene expression changes. Only GO terms with complete annotation and associated gene-level expression data were retained.
+
+Circular plots were used to jointly visualize GO term enrichment, associated genes, and directionality of gene expression (log2 fold change), as well as term-level z-scores. These visualizations provide an integrated view of functional enrichment patterns across conditions. For interpretability, an example subset of GO terms associated with cluster 7 genes (highlighted in the D0–D1 transition block) is shown to illustrate early post-settlement transcriptional responses under both experimental conditions. This subset represents a focused view of the broader enrichment structure. Figures were manually refined for presentation purposes, including adjustments to color scaling, label size, and layout to improve readability and visual clarity.
+
+```{r GOplot-input, echo=TRUE, message=FALSE, warning=FALSE}
+# Prepare GO enrichment input data
+# This file contains curated GO enrichment results (manually formatted from topGO output)
+df <- read.delim("./summary_genes.cluster7.txt", header = TRUE, sep = "\t", dec = ".") 
+
+# Load gene–GO mapping file (Links GO terms to associated genes)
+goTerms <- read.table("./manini.GOterm.genes.final.txt", header = TRUE, sep = "\t") 
+
+# File structure example:
+# go_term      target_id
+# GO:0001234   gene1, gene2, gene3
+
+# Merge GO terms with gene annotations
+data <- inner_join(df, goTerms, by = c("ID" = "go_term"))
+
+# Format final GO dataset
+# Standardize column names and structure for GOplot
+data <- data %>%
+  rename(Genes = target_id) %>%
+  dplyr::select(Category, ID, Term, Genes, adj_pval)
+
+# Convert key columns to factors (required by GOplot)
+cols <- c("Category", "ID", "Term", "Genes")
+data[cols] <- lapply(data[cols], as.factor)  
+
+# Select GO terms of interest
+# Load predefined list of biological processes to visualise
+process <- read.delim("./GOplot_process.cluster7.txt", header = TRUE, sep = "\t", dec = ".") 
+
+# Match selected GO terms to enriched dataset
+filter <- match(process$Term, data$Term)
+filt_data <- data[filter, ]
+
+# Gene-level DESeq2 results
+geneList <- read.delim("./D0vsD1.allGenes.txt", header = TRUE, sep = "\t", dec = ".") 
+
+geneList <- geneList[, -1] ## Remove first column
+
+geneList <- subset(geneList, select = c("target_id", "log2FoldChange", "padj")) ## Select columns of interest
+
+colnames(geneList) <- c("ID", "logFC", "adj.P.Val") ## Rename columns
+
+geneList$ID <- factor(geneList$ID)
+
+geneList$logFC <- -1 * geneList$logFC ## do this to see up-regulated genes in D0
+
+# Build GOplot object
+# Integrates GO terms with gene expression
+circ <- circle_dat(filt_data, geneList)
+
+# Remove incomplete cases
+circ <- circ[complete.cases(circ$zscore), ] 
+
+# Subset size
+IDs <- nrow(filt_data)
+```
+
+```{r GOplot, echo=TRUE, message=FALSE, warning=FALSE, fig.width=6, fig.height=6}
+# Circular GO plot
+# NOTE: This figure includes an example subset of GO terms associated with cluster 7 genes highlighted in the D0–D1 transition block to illustrate early developmental transcriptional responses.
+GOCircle(
+  circ,
+  nsub = IDs,
+  rad1 = 1.5,
+  rad2 = 2.4,
+  zsc.col = c("red", "white", "blue"),
+  lfc.col = c("red", "blue"),
+  label.size = 3,
+  table.legend = TRUE
+)
+```
+
+##### Gene expression profiling of functional gene sets
+
+To explore transcriptional patterns associated with biological pathways of interest, gene expression profiles were analyzed across curated gene sets representing metabolic, endocrine, pigmentation, stress-response, and developmental processes. For each gene set, variance-stabilized expression values were extracted from the DESeq2 object and visualized using PCA to summarize multivariate expression structure across developmental stages and habitat conditions (aquarium vs tidal pool). Samples were projected onto PC1 and PC2, which captured the largest proportion of variance within each gene subset, allowing assessment of coordinated transcriptional shifts among functionally related genes.
+
+To complement PCA-based visualization, PERMANOVA was used to test for significant differences in gene set expression across developmental stages. Euclidean distance matrices were calculated from variance-stabilized expression values, and significance was assessed using 10,000 permutations. Pairwise comparisons between developmental stages were subsequently performed with FDR correction to identify specific transitions contributing to overall transcriptional divergence.
+
+Heatmaps were generated for each curated gene set using row-scaled variance-stabilized expression values. Genes were displayed across all samples to visualize relative expression patterns, temporal dynamics, and coordinated transcriptional responses within functional pathways. Row scaling emphasized changes in expression across developmental stages while minimizing differences in absolute expression magnitude among genes.
+
+In addition, gene-level expression profiles were visualized using normalized DESeq2 counts transformed as log2(count + 1). Individual genes were plotted across developmental stages to examine temporal expression trajectories within each pathway, with overlaid mean trends highlighting overall changes in pathway activity through post-settlement development. Together, these complementary analyses provided pathway-level, gene-level, and multivariate perspectives on transcriptional dynamics during the post-settlement transition.
+
+All figures presented in the manuscript were subsequently refined for visual presentation, including adjustments to layout, labeling, color schemes, and graphical elements to improve clarity and readability.
+
+```{r GeneSets-input, echo=TRUE, message=FALSE, warning=FALSE}
+# List of curated gene sets (each file contains target_id column)
+dataFiles <- c(
+  "all.melanophores.txt",
+  "all.metabolism.txt",
+  "all.xanthophores.txt",
+  "appetite.stimulating.txt",
+  "appetite.suppressing.txt",
+  "beta.oxidation.txt",
+  "cholesterol.biosynthesis.txt",
+  "corticosteroids.txt",
+  "digestion.carbohydrases.txt",
+  "digestion.lipases.txt",
+  "digestion.proteases.txt",
+  "fatty.acid.metabolism.txt",
+  "glycogenesis.txt",
+  "glycogenolysis.txt",
+  "glycolysis.txt",
+  "heatshock.txt",
+  "HPI.txt",
+  "HPT.txt",
+  "hypoxia.txt",
+  "intestinal.development.txt",
+  "iridophores.txt",
+  "krebs.cycle.txt",
+  "lactic.fermentation.txt",
+  "osmoregulation.txt",
+  "ossification.txt",
+  "pdh.complex.txt",
+  "phototransduction.txt",
+  "retinoic.acid.txt",
+  "ROS.txt",
+  "TH.signaling.txt",
+  "vision.txt"
+)
+```
+
+```{r GeneSets-PCA, echo=TRUE, message=FALSE, warning=FALSE, fig.width=5, fig.height=5}
+# PCA on each gene set
+for (file in dataFiles) {
+  # Read gene set annotation file (must contain column: target_id)
+  data <- read.table(file.path("../gene_lists/", file), header = TRUE, sep = "\t")
+  
+  # Extract expression matrix for genes in current set
+  vstDf <- as.data.frame(vstMatrix)
+  vstDf <- rownames_to_column(vstDf, var = "target_id") 
+  geneCounts <- vstDf %>% filter(target_id %in% data$target_id)
+  row.names(geneCounts) <- geneCounts[, 1]
+  geneCounts <- geneCounts[, -1]
+  
+  # PCA clustering based on specific gene set
+  pca <- prcomp(t(geneCounts), scale. = T)
+  percentVar <- pca$sdev^2 / sum(pca$sdev^2)
+  
+  # Build plotting dataframe
+  df <- cbind(sampleInfo, pca$x)
+  df$day <- factor(df$day, levels = c("D0", "D1", "D3", "D8"))
+  df$site <- factor(df$site, levels = c("aquaria", "tidal-pool"))
+ 
+  # Color / shape scheme
+  my_colors <- c("D0" = "#00a087ff", "D1" = "#a05a2cff", "D3" = "#3131fbff", "D8" = "#cc229eff")
+  my_shapes <- c("aquaria" = 16, "tidal-pool" = 17)
+  
+  # PCA plot (NOT saved, only displayed)
+  pca_plot <- ggplot(df, aes(x = PC1, y = PC2, color = day, shape = site, group = day)) + 
+    geom_point(size = 4) + 
+    geom_vline(xintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey") + 
+    geom_hline(yintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey")+
+    scale_color_manual(values = my_colors) + scale_shape_manual(values = my_shapes) +
+    stat_ellipse(lwd = 0.2) +
+    xlab(sprintf("PC1 (%.2f%%)", percentVar[1] * 100)) +
+    ylab(sprintf("PC2 (%.2f%%)", percentVar[2] * 100)) +
+    theme_minimal() +
+    theme(
+      axis.title = element_text(colour = "black", size = 13),
+      axis.text = element_text(colour = "black", size = 12),
+      axis.ticks = element_line(colour = "black", linewidth = 0.5),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank()
+    ) +
+    guides(
+      color = guide_legend(title = "Day"),
+      shape = guide_legend(title = "Site")
+    )
+} 
+```
+
+```{r GeneSets-PERMANOVA, echo=TRUE, message=FALSE, warning=FALSE}
+# PERMANOVA per gene set
+for (file in dataFiles) {
+  # Read gene set annotation file
+  data <- read.table(file.path("../gene_lists/", file), header = TRUE, sep = "\t")
+  
+  # Extract expression matrix
+  vstDf <- as.data.frame(vstMatrix)
+  vstDf <- rownames_to_column(vstDf, var = "target_id") 
+  geneCounts <- vsdDf %>% filter(target_id %in% data$target_id)
+  row.names(geneCounts) <- geneCounts[, 1]
+  geneCounts <- geneCounts[, -1]
+  
+  # Distance matrix (samples × samples)
+  dis <- vegdist(t(geneCounts), method = "euclidean", na.rm = TRUE) 
+  day <- factor(c(rep(1,7), rep(2,11), rep(3,5), rep(4,5)), labels = c("D0", "D1", "D3", "D8"))
+  
+  # PERMANOVA model
+  permanova <- adonis2(dis ~ day, data = sampleInfo, permutations = 10000)
+  
+  # Pairwise comparisons
+  comparisons <- pairwise.perm.manova(dis, day, p.method = "fdr", nperm = 10000)
+  
+  # Print results to console (no file writing)
+  cat("\n============================\n")
+  cat("Results for:", file, "\n")
+  print(permanova)
+  cat("\nPairwise comparisons:\n")
+  print(comparisons)
+}
+```
+
+```{r GeneSets-heatmaps, echo=TRUE, message=FALSE, warning=FALSE, fig.width=5, fig.height=5}
+# Generate heatmaps for curated gene sets
+for (file in dataFiles) {
+  # Read gene set annotation file
+  data <- read.table(file.path("../gene_lists/", file), header = TRUE, sep = "\t")
+
+  # Convert variance-stabilized matrix to data frame
+  vstDf <- as.data.frame(vsdMatrix)
+  vstDf <- rownames_to_column(vstDf, var = "target_id")
+
+  # Retain only genes belonging to the current gene set
+  geneCounts <- vstDf %>%
+    filter(target_id %in% data$target_id)
+
+  # Add gene names and use them as row labels
+  geneCounts <- merge(
+    geneCounts,
+    data,
+    by = "target_id",
+    all.x = TRUE
+  )
+
+  row.names(geneCounts) <- geneCounts$gene_id
+
+  # Keep only expression values
+  geneCounts <- geneCounts[, c("gene_id", names(vstDf)[-1])]
+  geneCounts <- geneCounts[, -1]
+
+  # Plot heatmap
+  pheatmap(
+    geneCounts,
+    scale = "row",
+    col = colorRampPalette(c("blue", "white", "red"))(256),
+    border_color = NA,
+    cluster_cols = FALSE,
+    fontsize_row = 8,
+    angle_col = 45,
+    cellwidth = 20,
+    cellheight = 8.5
+  )
+}
+```
+
+```{r GeneSets-lineplots, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=10}
+# Generate line plots for curated gene sets
+# Create an empty list to store processed expression data
+geneCountsList <- list()
+
+# Prepare expression matrices for each gene set
+for (file in dataFiles) {
+
+  # Read gene set annotation file
+  data <- read.table(file.path("../gene_lists/", file), header = TRUE, sep = "\t")
+
+  # Extract normalized counts for genes in the current set
+  geneCounts <- normCounts %>%
+    inner_join(data, by = "target_id") %>%
+    dplyr::select(gene_id, everything(), -target_id) %>%
+    arrange(gene_id) %>%
+    mutate_at(vars(-gene_id), ~ log2(. + 1))
+
+  # Convert to long format and assign developmental stage
+  geneCounts <- geneCounts %>%
+    pivot_longer(-gene_id, names_to = "sample", values_to = "Value") %>%
+    mutate(day = case_when(grepl("^D0", sample) ~ "D0",
+                           grepl("^D1", sample) ~ "D1",
+                           grepl("^D3", sample) ~ "D3",
+                           grepl("^D8", sample) ~ "D8", TRUE ~ "Other")) %>%
+    dplyr::select(sample, day, gene_id, Value) %>%
+    pivot_wider(names_from = gene_id, values_from = Value)
+
+  # Ensure chronological ordering of developmental stages
+  geneCounts$day <- factor(geneCounts$day, levels = c("D0", "D1", "D3", "D8"))
+
+  # Store processed data for downstream plotting
+  geneCountsList[[file]] <- geneCounts
+}
+
+### Generate multi-panel expression plots
+for (file in dataFiles) {
+
+  geneCounts <- geneCountsList[[file]]
+
+  # Identify gene columns to plot
+  cols_to_plot <- colnames(geneCounts)[!(colnames(geneCounts) %in% c("sample", "day"))]
+
+  # Split genes into groups of 12 per figure
+  col_groups <- split(cols_to_plot,
+    rep(1:(ceiling(length(cols_to_plot) / 12)), each = 12, length.out = length(cols_to_plot))
+  )
+
+  # Create one panel per gene
+  for (i in seq_along(col_groups)) {
+
+    cols <- col_groups[[i]]
+    plots <- list()
+
+    for (col in cols) {
+
+      p <- ggplot(
+        data = geneCounts,
+        aes(x = day, y = !!sym(col), color = day, fill = day)) +
+        geom_point(position = position_jitterdodge(), size = 1, show.legend = FALSE) +
+        geom_line(data = geneCounts %>% group_by(day) %>% summarize(mean_value = mean(!!sym(col))),
+                  aes(x = day, y = mean_value), size = 0.5, color = "black", group = 1) +
+        labs(title = col, x = "", y = "Expression level") +
+        scale_color_manual(values = c("D0" = "#00a087ff", "D1" = "#a05a2cff", "D3" = "#3131fbff", "D8" = "#cc229eff")) +
+        scale_fill_manual(values = c("D0" = "#00a087ff", "D1" = "#a05a2cff", "D3" = "#3131fbff", "D8" = "#cc229eff")) +
+        theme_classic() +
+        theme(plot.title = element_text(size = 9),
+              axis.title = element_text(colour = "black", size = 8),
+              axis.text = element_text(colour = "black", size = 7),
+              axis.ticks = element_line(colour = "black", linewidth = 0.5),
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank(),
+              legend.position = "none")
+
+      plots[[col]] <- p
+    }
+
+    # Display multi-panel figure
+    grid.arrange(grobs = plots, ncol = 3, nrow = 4)
+  }
+}
+```
+
+### In situ experiment
+
+The in situ samples were analyzed using the same analytical workflow described for the aquarium experiment, including differential expression analysis, PCA, hierarchical clustering, functional enrichment, and pathway-focused visualizations. The same statistical frameworks, normalization procedures, and significance thresholds were applied; only dataset-specific inputs and contrasts differed between experiments.
+
+The in situ design included two complementary components. First, larvae were collected at settlement (day 0 in Temae; D0) during a natural recruitment event on the reef crest, representing the baseline physiological state immediately after capture from the pelagic environment. These larvae were then maintained in cages deployed across three nursery habitat types—beach rock, mangrove, and sand beach—and sampled over a developmental time series at D1, D3, and D8 post-capture, representing early post-settlement progression under semi-natural field conditions. Second, naturally settled juveniles were sampled directly from the same three habitats (beach rock, mangrove, and sand beach), representing individuals that had completed settlement and early benthic life history under fully natural conditions (see Methods for full experimental details).
+
+#### Importing counts and sample metadata 
+
+```{r load-data-insitu, echo=TRUE, message=FALSE, warning=FALSE}
+# NOTE: 'data' and 'sampleInfo' were previously used for the aquaria dataset. We are now overwriting them with the in situ dataset to avoid creating new object names and to keep the downstream analysis pipeline consistent.
+# Read file
+data <- read.table("./insitu_counts.txt", header = TRUE, sep = "\t", dec = ".") 
+
+# Format data frame
+rownames(data) <- data$target_id
+data <- data[, -1]
+
+# Get counts
+countData <- data %>% round()
+
+# Read metadata
+sampleInfo <- read.table("./insitu_metadata.txt", header = TRUE, sep = "\t")
+rownames(sampleInfo) <- sampleInfo$sample
+sampleInfo$sample <- NULL
+
+# Verify metadata
+all(rownames(sampleInfo) == colnames(countData))
+table(sampleInfo$site, sampleInfo$stage)
+```
+
+#### Quality Control
+
+```{r qc-boxplot-insitu, echo=TRUE, message=FALSE, warning=FALSE, fig.width=6, fig.height=3}
+# Assign colors by time point
+colors <- ifelse(
+    grepl("^BR", names(countData)), "#2b3ef1",
+    ifelse(
+        grepl("^MAN", names(countData)), "#4ab26f",
+        ifelse(
+            grepl("^SB", names(countData)), "#fb7730",
+            ifelse(
+                grepl("^TEM", names(countData)), "#b06cc7", "black"
+            )
+        )
+    )
+)
+
+boxplot(
+    log2(countData),
+    col = colors,
+    ylab = "log2(counts)",
+    notch = FALSE,
+    varwidth = FALSE,
+    cex = 0.4,
+    cex.axis = 0.8,
+    cex.lab = 0.8,
+    las = 2
+)
+```
+
+#### Normalization and DESeq2 object
+
+```{r deseq2-object-aquaria, echo=TRUE, message=FALSE, warning=FALSE}
+# Create DeSeq object
+dds <- DESeqDataSetFromMatrix(countData = as.matrix(countData), colData = sampleInfo, design = ~ 1)
+
+# Pre-filtering
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep, ]
+
+# Estimate size factors (normalization)
+dds <- estimateSizeFactors(dds)
+
+# Extract normalized counts
+normCounts <- counts(dds, normalized = TRUE) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("target_id")
+```
+
+#### Principal Component Analysis
+
+PCA was first performed on the full dataset, including all developmental stages and sampling sites, in order to capture the dominant axes of transcriptional variation in the experiment. This global analysis allows visualization of major sources of variation such as developmental progression and habitat-associated effects. To further disentangle habitat-driven variation from ontogenetic effects, PCA was also performed on subsets of the data corresponding to individual developmental stages. This stage-specific approach enables assessment of whether site-associated transcriptional differences are detectable independently of developmental variation.
+
+##### All samples
+
+```{r insitu-all, echo=TRUE, message=FALSE, warning=FALSE}
+# Variance-stabilizing transformation
+vst <- vst(dds, blind = TRUE) 
+vstMatrix <- assay(vst)
+
+# Perform PCA
+pca <- prcomp(t(vstMatrix), center = TRUE, scale. = TRUE)
+percentVar <- pca$sdev^2 / sum(pca$sdev^2)
+
+# Combine PCA coordinates with sample metadata
+pca_df <- cbind(sampleInfo, pca$x)
+
+# Set metadata variables as factors
+pca_df <- cbind(sampleInfo, pca$x)
+pca_df$site <- factor(pca_df$site, levels = c("Temae", "Beach Rock", "Mangrove", "Sand Beach"))
+pca_df$stage <- factor(pca_df$stage, levels = c("D0", "D1", "D3", "D8", "Juvenile"))
+
+# Choose color/shape scale accordingly
+colorSite <- c("Temae" = "#b06cc7", "Beach Rock" = "#2b3ef1", "Mangrove" = "#4ab26f", "Sand Beach" = "#fb7730")
+shapeStage <- c("D0" = 16, "D1" = 17, "D3" = 15, "D8" = 5, "Juvenile" = 6)
+
+# Theme customization
+theme <- 
+  theme(axis.title = element_text(colour = "black", size = 12),
+        axis.text = element_text(colour = "black", size = 11),
+        axis.ticks = element_line(colour = "black", linewidth = 0.5),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(fill = NA, colour = "black", size = 0.8),
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 8),
+        legend.key.size = unit(0.8, "lines")) 
+```
+
+```{r pca-insitu-all, echo=TRUE, message=FALSE, warning=FALSE, fig.width=12, fig.height=4}
+# PC1 vs PC2
+plot1 <-
+  ggplot(pca_df, aes(x = PC1, y = PC2, color = site, group = stage, shape = stage)) +
+  geom_point(size = 3.5) + 
+  geom_vline(xintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey") + 
+  geom_hline(yintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey")+
+  scale_color_manual(values = colorSite) + 
+  scale_fill_manual(values = colorSite) + 
+  scale_shape_manual(values = shapeStage) +
+  geom_text_repel(aes(label = rownames(pca_df)), size = 2.5) +
+  stat_ellipse(lwd = 0.2) +
+  xlab(sprintf("PC1 (%.2f%%)", percentVar[1] * 100)) +
+  ylab(sprintf("PC2 (%.2f%%)", percentVar[2] * 100)) +
+  theme_bw() + theme +
+  guides(color = guide_legend(title = "Site"), shape = guide_legend(title = "Stage"))
+
+# PC2 vs PC3
+plot2 <-
+  ggplot(pca_df, aes(x = PC2, y = PC3, color = site, group = stage, shape = stage)) + 
+  geom_point(size = 3.5) + 
+  geom_vline(xintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey") + 
+  geom_hline(yintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey")+
+  scale_color_manual(values = colorSite) + 
+  scale_fill_manual(values = colorSite) + 
+  scale_shape_manual(values = shapeStage) +
+  stat_ellipse(lwd = 0.2) +
+  xlab(sprintf("PC2 (%.2f%%)", percentVar[2] * 100)) +
+  ylab(sprintf("PC3 (%.2f%%)", percentVar[3] * 100)) +
+  theme_bw() + theme +
+  guides(color = guide_legend(title = "Site"), shape = guide_legend(title = "Stage"))
+
+grid.arrange(plot1, plot2, ncol = 2, nrow = 1)
+```
+
+##### D1
+
+```{r insitu-D1, echo=TRUE, message=FALSE, warning=FALSE}
+# Subset data for D1 samples only
+D1 <- countData %>% dplyr::select(contains("D1"))
+D1 <- D1 %>% dplyr::select(sort(names(D1)))
+sampleInfoD1 <- sampleInfo %>% filter(stage == "D1")
+sampleInfoD1 <- sampleInfoD1 %>% arrange(rownames(sampleInfoD1))
+
+# Build DESeq2 object for D1
+ddsD1 <- DESeqDataSetFromMatrix(countData = as.matrix(D1), colData = sampleInfoD1, design = ~ site)
+keep <- rowSums(counts(ddsD1)) >= 10
+ddsD1 <- ddsD1[keep, ]
+ddsD1 <- estimateSizeFactors(ddsD1)
+
+# Variance stabilization for D1
+vstD1 <- vst(ddsD1, blind = TRUE) 
+vstMatrixD1 <- assay(vstD1)
+
+# Get normalized counts 
+ddsD1 <- estimateSizeFactors(ddsD1)
+normCountsD1 <- counts(ddsD1, normalized = TRUE) %>% data.frame()
+normCountsD1$target_id <- rownames(normCountsD1)
+normCountsD1 <- normCountsD1[, c("target_id", names(normCountsD1)[-ncol(normCountsD1)])]
+rownames(normCountsD1) <- NULL
+
+# Perform PCA
+pca <- prcomp(t(vstMatrixD1), center = TRUE, scale. = TRUE)
+percentVar <- pca$sdev^2 / sum(pca$sdev^2)
+
+# Combine sample information with PCA results
+pca_df <- cbind(sampleInfoD1, pca$x)
+
+# Set metadata variables as factors
+pca_df <- cbind(sampleInfoD1, pca$x)
+pca_df$site <- factor(pca_df$site, levels = c("Beach Rock", "Mangrove", "Sand Beach"))
+
+# Choose color/shape scale accordingly
+colorSite <- c("Beach Rock" = "#2b3ef1", "Mangrove" = "#4ab26f", "Sand Beach" = "#fb7730")
+shapeStage <- c("D1" = 17)
+```
+
+```{r pca-insitu-D1, echo=TRUE, message=FALSE, warning=FALSE, fig.width=12, fig.height=4}
+# PC1 vs PC2
+plot1 <-
+  ggplot(pca_df, aes(x = PC1, y = PC2, color = site, group = site, shape = stage)) +
+  geom_point(size = 3.5) + 
+  geom_vline(xintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey") + 
+  geom_hline(yintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey")+
+  scale_color_manual(values = colorSite) + 
+  scale_fill_manual(values = colorSite) + 
+  scale_shape_manual(values = shapeStage) +
+  stat_ellipse(lwd = 0.2) +
+  xlab(sprintf("PC1 (%.2f%%)", percentVar[1] * 100)) +
+  ylab(sprintf("PC2 (%.2f%%)", percentVar[2] * 100)) +
+  theme_bw() + theme +
+  guides(color = guide_legend(title = "Site"), shape = "none", fill = guide_legend(title = "Site"))
+
+# PC2 vs PC3
+plot2 <-
+  ggplot(pca_df, aes(x = PC2, y = PC3, color = site, group = site, shape = stage)) + 
+  geom_point(size = 3.5) + 
+  geom_vline(xintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey") + 
+  geom_hline(yintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey")+
+  scale_color_manual(values = colorSite) + 
+  scale_fill_manual(values = colorSite) + 
+  scale_shape_manual(values = shapeStage) +
+  stat_ellipse(lwd = 0.2) +
+  xlab(sprintf("PC2 (%.2f%%)", percentVar[2] * 100)) +
+  ylab(sprintf("PC3 (%.2f%%)", percentVar[3] * 100)) +
+  theme_bw() + theme +
+  guides(color = guide_legend(title = "Site"), shape = "none", fill = guide_legend(title = "Site"))
+
+grid.arrange(plot1, plot2, ncol = 2, nrow = 1)
+```
+
+```{r insitu-D1-permanova, echo=TRUE, message=FALSE, warning=FALSE, fig.width=12, fig.height=4}
+# Compute Euclidean distance matrix from VST values
+dis <- vegdist(t(vstMatrixD1), method = "euclidean", na.rm = TRUE)
+
+# Define site factor
+site <- factor(c(rep("Beach Rock", 5), rep("Mangrove", 5), rep("Sand Beach", 5)))
+
+# Global PERMANOVA
+adonis2(dis ~ site, data = sampleInfoD1, permutations = 10000)
+
+# Pairwise PERMANOVA with FDR correction
+pairwise.perm.manova(dis, site, p.method = "fdr", nperm = 10000)
+```
+
+##### D3
+
+```{r insitu-D3, echo=TRUE, message=FALSE, warning=FALSE}
+# Subset data for D3 samples only
+D3 <- countData %>% dplyr::select(contains("D3"))
+D3 <- D3 %>% dplyr::select(sort(names(D3)))
+sampleInfoD3 <- sampleInfo %>% filter(stage == "D3")
+sampleInfoD3 <- sampleInfoD3 %>% arrange(rownames(sampleInfoD3))
+
+# Build DESeq2 object for D3
+ddsD3 <- DESeqDataSetFromMatrix(countData = as.matrix(D3), colData = sampleInfoD3, design = ~ site)
+keep <- rowSums(counts(ddsD3)) >= 10
+ddsD3 <- ddsD1[keep, ]
+ddsD3 <- estimateSizeFactors(ddsD3)
+
+# Variance stabilization for D3
+vstD3 <- vst(ddsD3, blind = TRUE) 
+vstMatrixD3 <- assay(vstD3)
+
+# Get normalized counts 
+ddsD3 <- estimateSizeFactors(ddsD3)
+normCountsD3 <- counts(ddsD3, normalized = TRUE) %>% data.frame()
+normCountsD3$target_id <- rownames(normCountsD3)
+normCountsD3 <- normCountsD3[, c("target_id", names(normCountsD3)[-ncol(normCountsD3)])]
+rownames(normCountsD3) <- NULL
+
+# Perform PCA
+pca <- prcomp(t(vstMatrixD3), center = TRUE, scale. = TRUE)
+percentVar <- pca$sdev^2 / sum(pca$sdev^2)
+
+# Combine sample information with PCA results
+pca_df <- cbind(sampleInfoD3, pca$x)
+
+# Set metadata variables as factors
+pca_df <- cbind(sampleInfoD3, pca$x)
+pca_df$site <- factor(pca_df$site, levels = c("Beach Rock", "Mangrove", "Sand Beach"))
+
+# Choose color/shape scale accordingly
+colorSite <- c("Beach Rock" = "#2b3ef1", "Mangrove" = "#4ab26f", "Sand Beach" = "#fb7730")
+shapeStage <- c("D3" = 15)
+```
+
+```{r pca-insitu-D3, echo=TRUE, message=FALSE, warning=FALSE, fig.width=12, fig.height=4}
+# PC1 vs PC2
+plot1 <-
+  ggplot(pca_df, aes(x = PC1, y = PC2, color = site, group = site, shape = stage)) +
+  geom_point(size = 3.5) + 
+  geom_vline(xintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey") + 
+  geom_hline(yintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey")+
+  scale_color_manual(values = colorSite) + 
+  scale_fill_manual(values = colorSite) + 
+  scale_shape_manual(values = shapeStage) +
+  stat_ellipse(lwd = 0.2) +
+  xlab(sprintf("PC1 (%.2f%%)", percentVar[1] * 100)) +
+  ylab(sprintf("PC2 (%.2f%%)", percentVar[2] * 100)) +
+  theme_bw() + theme +
+  guides(color = guide_legend(title = "Site"), shape = "none", fill = guide_legend(title = "Site"))
+
+# PC2 vs PC3
+plot2 <-
+  ggplot(pca_df, aes(x = PC2, y = PC3, color = site, group = site, shape = stage)) + 
+  geom_point(size = 3.5) + 
+  geom_vline(xintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey") + 
+  geom_hline(yintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey")+
+  scale_color_manual(values = colorSite) + 
+  scale_fill_manual(values = colorSite) + 
+  scale_shape_manual(values = shapeStage) +
+  stat_ellipse(lwd = 0.2) +
+  xlab(sprintf("PC2 (%.2f%%)", percentVar[2] * 100)) +
+  ylab(sprintf("PC3 (%.2f%%)", percentVar[3] * 100)) +
+  theme_bw() + theme +
+  guides(color = guide_legend(title = "Site"), shape = "none", fill = guide_legend(title = "Site"))
+
+grid.arrange(plot1, plot2, ncol = 2, nrow = 1)
+```
+
+```{r insitu-D3-permanova, echo=TRUE, message=FALSE, warning=FALSE, fig.width=12, fig.height=4}
+# Compute Euclidean distance matrix from VST values
+dis <- vegdist(t(vstMatrixD3), method = "euclidean", na.rm = TRUE)
+
+# Define site factor
+site <- factor(c(rep("Beach Rock", 3), rep("Mangrove", 5), rep("Sand Beach", 5)))
+
+# Global PERMANOVA
+adonis2(dis ~ site, data = sampleInfoD3, permutations = 10000)
+
+# Pairwise PERMANOVA with FDR correction
+pairwise.perm.manova(dis, site, p.method = "fdr", nperm = 10000)
+```
+
+##### D8
+
+```{r insitu-D8, echo=TRUE, message=FALSE, warning=FALSE}
+# Subset data for D8 samples only
+D8 <- countData %>% dplyr::select(contains("D8"))
+D8 <- D8 %>% dplyr::select(sort(names(D8)))
+sampleInfoD8 <- sampleInfo %>% filter(stage == "D8")
+sampleInfoD8 <- sampleInfoD8 %>% arrange(rownames(sampleInfoD8))
+
+# Build DESeq2 object for D8
+ddsD8 <- DESeqDataSetFromMatrix(countData = as.matrix(D8), colData = sampleInfoD8, design = ~ site)
+keep <- rowSums(counts(ddsD8)) >= 10
+ddsD8 <- ddsD1[keep, ]
+ddsD8 <- estimateSizeFactors(ddsD8)
+
+# Variance stabilization for D8
+vstD8 <- vst(ddsD8, blind = TRUE) 
+vstMatrixD8 <- assay(vstD8)
+
+# Get normalized counts 
+ddsD8 <- estimateSizeFactors(ddsD8)
+normCountsD8 <- counts(ddsD8, normalized = TRUE) %>% data.frame()
+normCountsD8$target_id <- rownames(normCountsD8)
+normCountsD8 <- normCountsD8[, c("target_id", names(normCountsD8)[-ncol(normCountsD8)])]
+rownames(normCountsD8) <- NULL
+
+# Perform PCA
+pca <- prcomp(t(vstMatrixD8), center = TRUE, scale. = TRUE)
+percentVar <- pca$sdev^2 / sum(pca$sdev^2)
+
+# Combine sample information with PCA results
+pca_df <- cbind(sampleInfoD8, pca$x)
+
+# Set metadata variables as factors
+pca_df <- cbind(sampleInfoD8, pca$x)
+pca_df$site <- factor(pca_df$site, levels = c("Beach Rock", "Mangrove", "Sand Beach"))
+
+# Choose color/shape scale accordingly
+colorSite <- c("Beach Rock" = "#2b3ef1", "Mangrove" = "#4ab26f", "Sand Beach" = "#fb7730")
+shapeStage <- c("D8" = 5)
+```
+
+```{r pca-insitu-D8, echo=TRUE, message=FALSE, warning=FALSE, fig.width=12, fig.height=4}
+# PC1 vs PC2
+plot1 <-
+  ggplot(pca_df, aes(x = PC1, y = PC2, color = site, group = site, shape = stage)) +
+  geom_point(size = 3.5) + 
+  geom_vline(xintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey") + 
+  geom_hline(yintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey")+
+  scale_color_manual(values = colorSite) + 
+  scale_fill_manual(values = colorSite) + 
+  scale_shape_manual(values = shapeStage) +
+  stat_ellipse(lwd = 0.2) +
+  xlab(sprintf("PC1 (%.2f%%)", percentVar[1] * 100)) +
+  ylab(sprintf("PC2 (%.2f%%)", percentVar[2] * 100)) +
+  theme_bw() + theme +
+  guides(color = guide_legend(title = "Site"), shape = "none", fill = guide_legend(title = "Site"))
+
+# PC2 vs PC3
+plot2 <-
+  ggplot(pca_df, aes(x = PC2, y = PC3, color = site, group = site, shape = stage)) + 
+  geom_point(size = 3.5) + 
+  geom_vline(xintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey") + 
+  geom_hline(yintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey")+
+  scale_color_manual(values = colorSite) + 
+  scale_fill_manual(values = colorSite) + 
+  scale_shape_manual(values = shapeStage) +
+  stat_ellipse(lwd = 0.2) +
+  xlab(sprintf("PC2 (%.2f%%)", percentVar[2] * 100)) +
+  ylab(sprintf("PC3 (%.2f%%)", percentVar[3] * 100)) +
+  theme_bw() + theme +
+  guides(color = guide_legend(title = "Site"), shape = "none", fill = guide_legend(title = "Site"))
+
+grid.arrange(plot1, plot2, ncol = 2, nrow = 1)
+```
+
+```{r insitu-D8-permanova, echo=TRUE, message=FALSE, warning=FALSE, fig.width=12, fig.height=4}
+# Compute Euclidean distance matrix from VST values
+dis <- vegdist(t(vstMatrixD8), method = "euclidean", na.rm = TRUE)
+
+# Define site factor
+site <- factor(c(rep("Mangrove", 5), rep("Sand Beach", 5)))
+
+# Global PERMANOVA
+adonis2(dis ~ site, data = sampleInfoD3, permutations = 10000)
+
+# Pairwise PERMANOVA with FDR correction
+pairwise.perm.manova(dis, site, p.method = "fdr", nperm = 10000)
+```
+
+##### Juveniles
+
+```{r insitu-JUV, echo=TRUE, message=FALSE, warning=FALSE}
+# Subset data for JUV samples only
+JUV <- countData %>% dplyr::select(contains("JUV"))
+JUV <- JUV %>% dplyr::select(sort(names(JUV)))
+sampleInfoJUV <- sampleInfo %>% filter(stage == "Juvenile")
+sampleInfoJUV <- sampleInfoJUV %>% arrange(rownames(sampleInfoJUV))
+
+# Build DESeq2 object for JUV
+ddsJUV <- DESeqDataSetFromMatrix(countData = as.matrix(JUV), colData = sampleInfoJUV, design = ~ site)
+keep <- rowSums(counts(ddsJUV)) >= 10
+ddsJUV <- ddsJUV[keep, ]
+ddsJUV <- estimateSizeFactors(ddsJUV)
+
+# Variance stabilization for JUV
+vstJUV <- vst(ddsJUV, blind = TRUE) 
+vstMatrixJUV <- assay(vstJUV)
+
+# Get normalized counts 
+ddsJUV <- estimateSizeFactors(ddsJUV)
+normCountsJUV <- counts(ddsJUV, normalized = TRUE) %>% data.frame()
+normCountsJUV$target_id <- rownames(normCountsJUV)
+normCountsJUV <- normCountsJUV[, c("target_id", names(normCountsJUV)[-ncol(normCountsJUV)])]
+rownames(normCountsJUV) <- NULL
+
+# Perform PCA
+pca <- prcomp(t(vstMatrixJUV), center = TRUE, scale. = TRUE)
+percentVar <- pca$sdev^2 / sum(pca$sdev^2)
+
+# Combine sample information with PCA results
+pca_df <- cbind(sampleInfoD1, pca$x)
+
+# Set metadata variables as factors
+pca_df <- cbind(sampleInfoJUV, pca$x)
+pca_df$site <- factor(pca_df$site, levels = c("Beach Rock", "Mangrove", "Sand Beach"))
+
+# Choose color/shape scale accordingly
+colorSite <- c("Beach Rock" = "#2b3ef1", "Mangrove" = "#4ab26f", "Sand Beach" = "#fb7730")
+shapeStage <- c("Juvenile" = 6)
+```
+
+
+```{r pca-insitu-D8, echo=TRUE, message=FALSE, warning=FALSE, fig.width=12, fig.height=4}
+# PC1 vs PC2
+plot1 <-
+  ggplot(pca_df, aes(x = PC1, y = PC2, color = site, group = site, shape = stage)) +
+  geom_point(size = 3.5) + 
+  geom_vline(xintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey") + 
+  geom_hline(yintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey")+
+  scale_color_manual(values = colorSite) + 
+  scale_fill_manual(values = colorSite) + 
+  scale_shape_manual(values = shapeStage) +
+  geom_text_repel(aes(label = rownames(pca_df)), size = 2.5) + 
+  stat_ellipse(lwd = 0.2) +
+  xlab(sprintf("PC1 (%.2f%%)", percentVar[1] * 100)) +
+  ylab(sprintf("PC2 (%.2f%%)", percentVar[2] * 100)) +
+  theme_bw() + theme +
+  guides(color = guide_legend(title = "Site"), shape = "none", fill = guide_legend(title = "Site"))
+
+# PC2 vs PC3
+plot2 <-
+  ggplot(pca_df, aes(x = PC2, y = PC3, color = site, group = site, shape = stage)) + 
+  geom_point(size = 3.5) + 
+  geom_vline(xintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey") + 
+  geom_hline(yintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey")+
+  scale_color_manual(values = colorSite) + 
+  scale_fill_manual(values = colorSite) + 
+  scale_shape_manual(values = shapeStage) +
+  stat_ellipse(lwd = 0.2) +
+  xlab(sprintf("PC2 (%.2f%%)", percentVar[2] * 100)) +
+  ylab(sprintf("PC3 (%.2f%%)", percentVar[3] * 100)) +
+  theme_bw() + theme +
+  guides(color = guide_legend(title = "Site"), shape = "none", fill = guide_legend(title = "Site"))
+
+grid.arrange(plot1, plot2, ncol = 2, nrow = 1)
+```
+
+```{r insitu-D8-permanova, echo=TRUE, message=FALSE, warning=FALSE, fig.width=12, fig.height=4}
+# Compute Euclidean distance matrix from VST values
+dis <- vegdist(t(vstMatrixJUV), method = "euclidean", na.rm = TRUE) 
+
+# Define site factor
+site <- factor(c(rep("Beach Rock", 8), rep("Mangrove", 6), rep("Sand Beach", 4)))
+
+# Global PERMANOVA
+adonis2(dis ~ site, data = sampleInfoJUV, permutations = 10000)
+
+# Pairwise PERMANOVA with FDR correction
+pairwise.perm.manova(dis, site, p.method = "fdr", nperm = 10000)
+```
+
+#### Differential expression analysis
+
+Differential expression analysis for the in situ dataset was performed as described for the aquarium experiment. For the purposes of this study, differential expression was restricted to comparisons between juvenile individuals across the three habitat types. This focus was chosen because it represents the most biologically meaningful and ecologically comparable stage, as juveniles have completed settlement and are directly exposed to habitat-specific environmental conditions, as detailed in the manuscript. DEG were defined as those with an adjusted p-value < 0.05 and an absolute log2 fold-change ≥ 0.58 (≈1.5-fold change).
+
+##### Mangrove vs Beach Rock
+
+```{r de-MANvsBR-JUV, echo=TRUE, message=FALSE, warning=FALSE}
+# Run DESeq2
+dds_JUV <- DESeq(ddsJUV)
+
+# Build results table
+res_JUV_MANvsBR <- results(dds_JUV, contrast = c("site", "Mangrove", "Beach Rock"), alpha = 0.5) 
+
+# Apply fold change shrinkage
+resLFC_JUV_MANvsBR <- lfcShrink(dds_JUV, contrast = contrast, res = res_JUV_MANvsBR, type = "ashr") 
+
+# Summarize results
+summary(res_JUV_MANvsBR, alpha = 0.05)
+
+# Retrieve original p-values
+resLFC_JUV_MANvsBR$padj <- res_JUV_MANvsBR$padj  
+
+# Define thresholds
+padj.cutoff <- 0.05
+lfc.cutoff <- log2(1.5)
+
+# Extract DEGs
+sigGenes_JUV_MANvsBR <- resLFC_JUV_MANvsBR[which(resLFC_JUV_MANvsBR$padj < padj.cutoff & 
+                        abs(resLFC_JUV_MANvsBR$log2FoldChange) >= lfc.cutoff), ]
+
+sigGenes_JUV_MANvsBR <- sigGenes_JUV_MANvsBR  %>% as.data.frame()
+
+# Up-regulated genes
+upGenes_JUV_MANvsBR <- subset(sigGenes_JUV_MANvsBR, log2FoldChange >= lfc.cutoff)
+
+# Down-regulated genes
+downGenes_JUV_MANvsBR <- subset(sigGenes_JUV_MANvsBR, log2FoldChange < lfc.cutoff)
+```
+
+```{r volcanoplot-MANvsBR-JUV, echo=TRUE, message=FALSE, warning=FALSE, fig.width=5, fig.height=6}
+# Convert DESeq2 results object to data frame and keep gene IDs
+resLFC_JUV_MANvsBR_ <- resLFC_JUV_MANvsBR %>% 
+  data.frame() %>% 
+  rownames_to_column(var = "target_id")
+
+# Define significance threshold
+resLFC_JUV_MANvsBR_ <- resLFC_JUV_MANvsBR_ %>% 
+  mutate(threshold = padj < padj.cutoff & abs(log2FoldChange) >= lfc.cutoff)
+
+# Define color mapping
+# IMPORTANT: EnhancedVolcano expects named colors mapped to point categories
+keyVals <- ifelse(
+  resLFC_JUV_MANvsBR_$log2FoldChange > lfc.cutoff, "red",
+  ifelse(
+    resLFC_JUV_MANvsBR_$log2FoldChange < -lfc.cutoff, "blue","dim gray")
+  )
+
+keyVals[is.na(keyVals)] <- "black"
+names(keyVals)[keyVals == "red"] <- "up-regulated"
+names(keyVals)[keyVals == "blue"] <- "down-regulated"
+names(keyVals)[keyVals == "dim gray"] <- "no change"
+
+# Select genes of interest to label
+genes_to_label <- c("jg10667", "jg26850", "jg26851", "jg12038", "jg12039", "jg12040", "jg12041", "jg12277") 
+
+# Volcano plot
+EnhancedVolcano(resLFC_JUV_MANvsBR_, 
+                x = "log2FoldChange", 
+                y = "pvalue",
+                pCutoff = padj.cutoff, 
+                FCcutoff = lfc.cutoff, 
+                lab = (resLFC_JUV_MANvsBR_$target_id), 
+                ylab = bquote(~Log[10] ~ "adjusted p-value"), 
+                selectLab = genes_to_label, 
+                pointSize = 2.5, 
+                labSize = 2.5, 
+                legendLabSize = 10, 
+                gridlines.major = FALSE, 
+                gridlines.minor = FALSE, 
+                title = NULL, 
+                subtitle = NULL, 
+                caption = NULL, 
+                colCustom = keyVals, 
+                colAlpha = 0.5) + 
+  theme_bw() +
+  theme(
+    axis.title = element_text(colour = "black", size = 13),
+    axis.text = element_text(colour = "black", size = 12),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5),
+    legend.title = element_blank(),
+    legend.key = element_rect(fill = "white"),
+    legend.background = element_rect(fill = "NA", color = "NA", linewidth = 0.5),
+    panel.border = element_rect(fill = NA, colour = "black", linewidth = 0.8)) +
+  coord_fixed(xlim = c(-5, 5), ylim = c(0, 20), ratio = 0.5) 
+```
+
+##### Mangrove vs Sand Beach
+
+```{r de-MANvsSB-JUV, echo=TRUE, message=FALSE, warning=FALSE}
+# Build results table
+res_JUV_MANvsSB <- results(dds_JUV, contrast = c("site", "Mangrove", "Sand Beach"), alpha = 0.5) 
+
+# Apply fold change shrinkage
+resLFC_JUV_MANvsSB <- lfcShrink(dds_JUV, contrast = contrast, res = res_JUV_MANvsSB, type = "ashr") 
+
+# Summarize results
+summary(res_JUV_MANvsSB, alpha = 0.05)
+
+# Retrieve original p-values
+resLFC_JUV_MANvsSB$padj <- res_JUV_MANvsSB$padj  
+
+# Extract DEGs
+sigGenes_JUV_MANvsSB <- resLFC_JUV_MANvsSB[which(resLFC_JUV_MANvsSB$padj < padj.cutoff & 
+                        abs(resLFC_JUV_MANvsSB$log2FoldChange) >= lfc.cutoff), ]
+
+sigGenes_JUV_MANvsSB <- sigGenes_JUV_MANvsSB %>% as.data.frame()
+
+# Up-regulated genes
+upGenes_JUV_MANvsSB <- subset(sigGenes_JUV_MANvsSB, log2FoldChange >= lfc.cutoff)
+
+# Down-regulated genes
+downGenes_JUV_MANvsSB <- subset(sigGenes_JUV_MANvsSB, log2FoldChange < lfc.cutoff)
+```
+
+```{r volcanoplot-MANvsSB-JUV, echo=TRUE, message=FALSE, warning=FALSE, fig.width=5, fig.height=6}
+# Convert DESeq2 results object to data frame and keep gene IDs
+resLFC_JUV_MANvsSB_ <- resLFC_JUV_MANvsSB %>% 
+  data.frame() %>% 
+  rownames_to_column(var = "target_id")
+
+# Define significance threshold
+resLFC_JUV_MANvsSB_ <- resLFC_JUV_MANvsBR_ %>% 
+  mutate(threshold = padj < padj.cutoff & abs(log2FoldChange) >= lfc.cutoff)
+
+# Define color mapping
+# IMPORTANT: EnhancedVolcano expects named colors mapped to point categories
+keyVals <- ifelse(
+  resLFC_JUV_MANvsSB_$log2FoldChange > lfc.cutoff, "red",
+  ifelse(
+    resLFC_JUV_MANvsSB_$log2FoldChange < -lfc.cutoff, "blue","dim gray")
+  )
+
+keyVals[is.na(keyVals)] <- "black"
+names(keyVals)[keyVals == "red"] <- "up-regulated"
+names(keyVals)[keyVals == "blue"] <- "down-regulated"
+names(keyVals)[keyVals == "dim gray"] <- "no change"
+
+# Select genes of interest to label
+genes_to_label <- c("jg10667", "jg19725", "jg33238", "jg11378", "jg26850", "jg26851") 
+
+# Volcano plot
+EnhancedVolcano(resLFC_JUV_MANvsSB_, 
+                x = "log2FoldChange", 
+                y = "pvalue",
+                pCutoff = padj.cutoff, 
+                FCcutoff = lfc.cutoff, 
+                lab = (resLFC_JUV_MANvsSB_$target_id), 
+                ylab = bquote(~Log[10] ~ "adjusted p-value"), 
+                selectLab = genes_to_label, 
+                pointSize = 2.5, 
+                labSize = 2.5, 
+                legendLabSize = 10, 
+                gridlines.major = FALSE, 
+                gridlines.minor = FALSE, 
+                title = NULL, 
+                subtitle = NULL, 
+                caption = NULL, 
+                colCustom = keyVals, 
+                colAlpha = 0.5) + 
+  theme_bw() +
+  theme(
+    axis.title = element_text(colour = "black", size = 13),
+    axis.text = element_text(colour = "black", size = 12),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5),
+    legend.title = element_blank(),
+    legend.key = element_rect(fill = "white"),
+    legend.background = element_rect(fill = "NA", color = "NA", linewidth = 0.5),
+    panel.border = element_rect(fill = NA, colour = "black", linewidth = 0.8)) +
+  coord_fixed(xlim = c(-5, 5), ylim = c(0, 20), ratio = 0.5) 
+```
+
+##### Sand Beach vs Beach Rock
+
+```{r de-SBvsBRB-JUV, echo=TRUE, message=FALSE, warning=FALSE}
+# Build results table
+res_JUV_SBvsBR <- results(dds_JUV, contrast = c("site", "Sand Beach", "Beach Rock"), alpha = 0.5) 
+
+# Apply fold change shrinkage
+resLFC_JUV_SBvsBR <- lfcShrink(dds_JUV, contrast = contrast, res = res_JUV_SBvsBR, type = "ashr") 
+
+# Summarize results
+summary(res_JUV_SBvsBR, alpha = 0.05)
+
+# Retrieve original p-values
+resLFC_JUV_SBvsBR$padj <- res_JUV_SBvsBR$padj  
+
+# Extract DEGs
+sigGenes_JUV_SBvsBR <- resLFC_JUV_SBvsBR[which(resLFC_JUV_MANvsSB$padj < padj.cutoff & 
+                        abs(resLFC_JUV_SBvsBR$log2FoldChange) >= lfc.cutoff), ]
+
+sigGenes_JUV_SBvsBR <- sigGenes_JUV_SBvsBR %>% as.data.frame()
+
+# Up-regulated genes
+upGenes_JUV_SBvsBR <- subset(sigGenes_JUV_SBvsBR, log2FoldChange >= lfc.cutoff)
+
+# Down-regulated genes
+downGenes_JUV_SBvsBR <- subset(sigGenes_JUV_SBvsBR, log2FoldChange < lfc.cutoff)
+```
+
+```{r volcanoplot-SBvsBR-JUV, echo=TRUE, message=FALSE, warning=FALSE, fig.width=5, fig.height=6}
+# Convert DESeq2 results object to data frame and keep gene IDs
+resLFC_JUV_SBvsBR_ <- resLFC_JUV_SBvsBR %>% 
+  data.frame() %>% 
+  rownames_to_column(var = "target_id")
+
+# Define significance threshold
+resLFC_JUV_SBvsBR_ <- resLFC_JUV_SBvsBR_ %>% 
+  mutate(threshold = padj < padj.cutoff & abs(log2FoldChange) >= lfc.cutoff)
+
+# Define color mapping
+# IMPORTANT: EnhancedVolcano expects named colors mapped to point categories
+keyVals <- ifelse(
+  resLFC_JUV_SBvsBR_$log2FoldChange > lfc.cutoff, "red",
+  ifelse(
+    resLFC_JUV_SBvsBR_$log2FoldChange < -lfc.cutoff, "blue","dim gray")
+  )
+
+keyVals[is.na(keyVals)] <- "black"
+names(keyVals)[keyVals == "red"] <- "up-regulated"
+names(keyVals)[keyVals == "blue"] <- "down-regulated"
+names(keyVals)[keyVals == "dim gray"] <- "no change"
+
+# Select genes of interest to label
+genes_to_label <- c("jg15342", "jg33789", "jg7642", "jg19726") 
+
+# Volcano plot
+EnhancedVolcano(resLFC_JUV_SBvsBR_, 
+                x = "log2FoldChange", 
+                y = "pvalue",
+                pCutoff = padj.cutoff, 
+                FCcutoff = lfc.cutoff, 
+                lab = (resLFC_JUV_SBvsBR_$target_id), 
+                ylab = bquote(~Log[10] ~ "adjusted p-value"), 
+                selectLab = genes_to_label, 
+                pointSize = 2.5, 
+                labSize = 2.5, 
+                legendLabSize = 10, 
+                gridlines.major = FALSE, 
+                gridlines.minor = FALSE, 
+                title = NULL, 
+                subtitle = NULL, 
+                caption = NULL, 
+                colCustom = keyVals, 
+                colAlpha = 0.5) + 
+  theme_bw() +
+  theme(
+    axis.title = element_text(colour = "black", size = 13),
+    axis.text = element_text(colour = "black", size = 12),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5),
+    legend.title = element_blank(),
+    legend.key = element_rect(fill = "white"),
+    legend.background = element_rect(fill = "NA", color = "NA", linewidth = 0.5),
+    panel.border = element_rect(fill = NA, colour = "black", linewidth = 0.8)) +
+  coord_fixed(xlim = c(-5, 5), ylim = c(0, 20), ratio = 0.5) 
+```
+
+#### Gene expression profiling of functional gene sets
+
+To explore transcriptional patterns associated with biological pathways of interest, gene expression profiles were analyzed across curated gene sets, following the same approach previously applied to the aquaria dataset. All figures presented in the manuscript were subsequently refined for presentation, including adjustments to layout, labeling, color schemes, and graphical elements to improve clarity and readability.
+
+```{r GeneSets-PCA-JUV, echo=TRUE, message=FALSE, warning=FALSE, fig.width=5, fig.height=5}
+# PCA on each gene set
+for (file in dataFiles) {
+  path <- file.path("../gene_lists/", file)
+  
+  # Skip if file is missing
+  if (!file.exists(path)) {
+    message("Skipping missing file: ", path)
+    next
+  }
+  
+  # Read gene set annotation file (must contain column: target_id)
+  data <- read.table(path, header = TRUE, sep = "\t")
+  
+  # Extract expression matrix for genes in current set
+  vstDf <- as.data.frame(vstMatrixJUV)
+  vstDf <- rownames_to_column(vstDf, var = "target_id") 
+  geneCounts <- vstDf %>% filter(target_id %in% data$target_id)
+  geneCounts <- merge(geneCounts, data, by.x = "target_id", by.y = "target_id", all.x = TRUE)
+  
+  if (nrow(geneCounts) == 0) {
+  message("No matching genes found for: ", file)
+  next
+  }
+  
+  row.names(geneCounts) <- geneCounts$gene_id
+  geneCounts <- geneCounts[, c("gene_id", names(vstDf)[-1])]
+  geneCounts <- geneCounts[, -1]
+  
+  # PCA clustering based on specific gene set
+  pca <- prcomp(t(geneCounts), scale. = T)
+  percentVar <- pca$sdev^2 / sum(pca$sdev^2)
+  
+  # Build plotting dataframe
+  df <- cbind(sampleInfoJUV, pca$x)
+  df$site <- factor(df$site, levels = c("Beach Rock", "Mangrove", "Sand Beach"))
+
+  # Extract gene set title
+  geneSetName <- gsub("manini\\.|\\.txt", "", file)
+  
+  # Define color/shape mapping
+  colorSite <- c("Beach Rock" = "#2b3ef1", "Mangrove" = "#4ab26f", "Sand Beach" = "#fb7730") 
+  shapeStage <- c("Juvenile" = 6)
+  
+    # PCA plot (NOT saved, only displayed)
+  pca_plot <- ggplot(df, aes(x = PC1, y = PC2, color = site, group = site, shape = stage)) + 
+    geom_point(size = 4) + 
+    geom_vline(xintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey") + 
+    geom_hline(yintercept = 0, linetype = 2, linewidth = 0.5, color = "lightgrey")+
+    scale_color_manual(values = colorSite, labels = c("Beach Rock", "Mangrove", "Sand Beach")) + 
+    scale_fill_manual(values = colorSite, labels = c("Beach Rock", "Mangrove", "Sand Beach")) + 
+    scale_shape_manual(values = shapeStage, labels = c("Juvenile")) +
+    stat_ellipse(lwd = 0.2) +
+    xlab(sprintf("PC1 (%.2f%%)", percentVar[1] * 100)) +
+    ylab(sprintf("PC2 (%.2f%%)", percentVar[2] * 100)) +
+    ggtitle(paste("Gene Set:", geneSetName)) + 
+    theme_bw() +
+    theme(axis.title = element_text(colour = "black", size = 12),
+        axis.text = element_text(colour = "black", size = 11),
+        axis.ticks = element_line(colour = "black", linewidth = 0.5),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(fill = NA, colour = "black", size = 0.8),
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 8),
+        legend.key.size = unit(0.8, "lines")) +
+    guides(
+      color = guide_legend(title = "Day"),
+      shape = guide_legend(title = "Site")
+    )
+  
+  print(pca_plot)
+} 
+```
+
+```{r GeneSets-JUV-PERMANOVA, echo=TRUE, message=FALSE, warning=FALSE}
+# PERMANOVA per gene set
+for (file in dataFiles) {
+  # Read gene set annotation file
+  data <- read.table(file.path("../gene_lists/", file), header = TRUE, sep = "\t")
+  
+  # Extract expression matrix
+  vstDf <- as.data.frame(vstMatrixJUV)
+  vstDf <- rownames_to_column(vstDf, var = "target_id") 
+  geneCounts <- vsdDf %>% filter(target_id %in% data$target_id)
+  row.names(geneCounts) <- geneCounts[, 1]
+  geneCounts <- geneCounts[, -1]
+  
+  # Distance matrix (samples × samples)
+  dis <- vegdist(t(geneCounts), method = "euclidean", na.rm = TRUE) 
+  day <- factor(c(rep(1,4), rep(2,3), rep(3,4)), labels = c("Beach Rock", "Mangrove", "Sand Beach"))
+  
+  # PERMANOVA model
+  permanova <- adonis2(dis ~ day, data = sampleInfoJUV, permutations = 10000)
+  
+  # Pairwise comparisons
+  comparisons <- pairwise.perm.manova(dis, day, p.method = "fdr", nperm = 10000)
+  
+  # Print results to console (no file writing)
+  cat("\n============================\n")
+  cat("Results for:", file, "\n")
+  print(permanova)
+  cat("\nPairwise comparisons:\n")
+  print(comparisons)
+}
+```
+
+```{r GeneSets-heatmaps-JUV, echo=TRUE, message=FALSE, warning=FALSE, fig.width=5, fig.height=5}
+# Generate heatmaps for curated gene sets
+for (file in dataFiles) {
+  # Read gene set annotation file
+  data <- read.table(file.path("../gene_lists/", file), header = TRUE, sep = "\t")
+
+  # Convert variance-stabilized matrix to data frame
+  vstDf <- as.data.frame(vsdMatrixJUV)
+  vstDf <- rownames_to_column(vstDf, var = "target_id")
+
+  # Retain only genes belonging to the current gene set
+  geneCounts <- vstDf %>%
+    filter(target_id %in% data$target_id)
+
+  # Add gene names and use them as row labels
+  geneCounts <- merge(
+    geneCounts,
+    data,
+    by = "target_id",
+    all.x = TRUE
+  )
+
+  row.names(geneCounts) <- geneCounts$gene_id
+
+  # Keep only expression values
+  geneCounts <- geneCounts[, c("gene_id", names(vstDf)[-1])]
+  geneCounts <- geneCounts[, -1]
+
+  # Plot heatmap
+  pheatmap(
+    geneCounts,
+    scale = "row",
+    col = colorRampPalette(c("blue", "white", "red"))(256),
+    border_color = NA,
+    cluster_cols = FALSE,
+    fontsize_row = 8,
+    angle_col = 45,
+    cellwidth = 20,
+    cellheight = 8.5
+  )
+}
+```
+
+### Packages used
+
+```{r, echo=FALSE}
+sessionInfo()
+```
+
